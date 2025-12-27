@@ -2,19 +2,16 @@ import os
 import logging
 import threading
 import time
-from flask import Flask, request, redirect, url_for, flash, jsonify, render_template_string, render_template
+from flask import Flask, request, redirect, url_for, flash, jsonify, render_template_string
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from flask_admin import Admin, BaseView, expose
 from flask_admin.contrib.sqla import ModelView
-from flask_admin.form import Select2Widget
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 import json
 import requests
 from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
-from wtforms import Form, StringField, TextAreaField, FloatField, IntegerField, SelectField, BooleanField
-from wtforms.validators import DataRequired, Optional
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -330,18 +327,6 @@ login_manager.login_view = 'login'
 def load_user(user_id):
     return User.query.get(int(user_id))
 
-# Формы для быстрого добавления
-class QuickAddForm(Form):
-    title = StringField('Название автомобиля', validators=[DataRequired()])
-    price_usd = FloatField('Цена ($)', validators=[DataRequired()])
-    brand_name = StringField('Новый бренд (если нет в списке)')
-    brand_id = SelectField('Выберите существующий бренд', coerce=int)
-    model_name = StringField('Новая модель')
-    model_id = SelectField('Выберите существующую модель', coerce=int)
-    year = IntegerField('Год выпуска', validators=[Optional()])
-    mileage_km = IntegerField('Пробег (км)', validators=[Optional()])
-    description = TextAreaField('Описание')
-
 # Создаем отдельную страницу для быстрого добавления
 @app.route('/admin/quick-add', methods=['GET', 'POST'])
 @login_required
@@ -365,16 +350,21 @@ def quick_add():
             photo_url2 = request.form.get('photo_url2', '')
             photo_url3 = request.form.get('photo_url3', '')
             photo_url4 = request.form.get('photo_url4', '')
+            fuel_type = request.form.get('fuel_type', '')
+            transmission = request.form.get('transmission', '')
+            color = request.form.get('color', '')
+            engine_capacity = request.form.get('engine_capacity')
             
             # Определяем бренд
+            final_brand_id = None
             if brand_name:
                 # Создаем новый бренд
                 brand = Brand(name=brand_name, is_active=True)
                 db.session.add(brand)
-                db.session.flush()  # Получаем ID нового бренда
-                brand_id = brand.id
+                db.session.flush()
+                final_brand_id = brand.id
             elif brand_id:
-                brand_id = int(brand_id)
+                final_brand_id = int(brand_id)
             else:
                 flash('Необходимо указать бренд', 'danger')
                 return redirect(url_for('quick_add'))
@@ -383,7 +373,7 @@ def quick_add():
             final_model_id = None
             if model_name:
                 # Создаем новую модель
-                model = CarModel(name=model_name, brand_id=brand_id, is_active=True)
+                model = CarModel(name=model_name, brand_id=final_brand_id, is_active=True)
                 db.session.add(model)
                 db.session.flush()
                 final_model_id = model.id
@@ -395,16 +385,27 @@ def quick_add():
                 title=title,
                 description=description,
                 price_usd=price_usd,
-                brand_id=brand_id,
+                brand_id=final_brand_id,
                 model_id=final_model_id,
                 year=int(year) if year else None,
                 mileage_km=int(mileage_km) if mileage_km else None,
+                fuel_type=fuel_type,
+                transmission=transmission,
+                color=color,
+                engine_capacity=float(engine_capacity) if engine_capacity else None,
                 photo_url1=photo_url1,
                 photo_url2=photo_url2,
                 photo_url3=photo_url3,
                 photo_url4=photo_url4,
                 is_active=True
             )
+            
+            # Автоматически определяем ценовую категорию
+            categories = PriceCategory.query.filter_by(is_active=True).all()
+            for category in categories:
+                if category.min_price_usd <= car.price_usd <= category.max_price_usd:
+                    car.price_category_id = category.id
+                    break
             
             db.session.add(car)
             db.session.commit()
@@ -420,6 +421,7 @@ def quick_add():
     # Получаем бренды и модели для формы
     brands = Brand.query.filter_by(is_active=True).all()
     models = CarModel.query.filter_by(is_active=True).all()
+    price_categories = PriceCategory.query.filter_by(is_active=True).all()
     
     return render_template_string('''
 <!DOCTYPE html>
@@ -429,12 +431,13 @@ def quick_add():
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { background-color: #f8f9fa; padding-top: 20px; }
-        .container { max-width: 800px; }
+        .container { max-width: 1000px; }
         .card { border-radius: 10px; box-shadow: 0 0 20px rgba(0,0,0,0.1); }
         .card-header { background-color: #007bff; color: white; border-radius: 10px 10px 0 0 !important; }
         .btn-back { margin-right: 10px; }
         .form-section { border: 1px solid #dee2e6; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
         .form-section h5 { color: #495057; border-bottom: 2px solid #007bff; padding-bottom: 5px; }
+        .required:after { content: " *"; color: red; }
     </style>
 </head>
 <body>
@@ -442,6 +445,7 @@ def quick_add():
         <div class="card">
             <div class="card-header">
                 <h4 class="mb-0">🚗 Быстрое добавление автомобиля</h4>
+                <small class="opacity-75">Добавьте новый автомобиль, бренд или модель в одну форму</small>
             </div>
             <div class="card-body">
                 {% with messages = get_flashed_messages(with_categories=true) %}
@@ -459,12 +463,12 @@ def quick_add():
                     <div class="form-section">
                         <h5>Основная информация</h5>
                         <div class="row mb-3">
-                            <div class="col-md-6">
-                                <label class="form-label">Название автомобиля *</label>
+                            <div class="col-md-8">
+                                <label class="form-label required">Название автомобиля</label>
                                 <input type="text" class="form-control" name="title" required placeholder="Toyota Camry 2020">
                             </div>
-                            <div class="col-md-6">
-                                <label class="form-label">Цена ($) *</label>
+                            <div class="col-md-4">
+                                <label class="form-label required">Цена ($)</label>
                                 <input type="number" step="0.01" class="form-control" name="price_usd" required placeholder="15000">
                             </div>
                         </div>
@@ -515,17 +519,66 @@ def quick_add():
                     <div class="form-section">
                         <h5>Характеристики</h5>
                         <div class="row mb-3">
-                            <div class="col-md-4">
+                            <div class="col-md-3">
                                 <label class="form-label">Год выпуска</label>
                                 <input type="number" class="form-control" name="year" min="1900" max="2024" placeholder="2020">
                             </div>
-                            <div class="col-md-4">
+                            <div class="col-md-3">
                                 <label class="form-label">Пробег (км)</label>
                                 <input type="number" class="form-control" name="mileage_km" placeholder="50000">
                             </div>
-                            <div class="col-md-4">
+                            <div class="col-md-3">
                                 <label class="form-label">Объем двигателя (л)</label>
                                 <input type="number" step="0.1" class="form-control" name="engine_capacity" placeholder="2.0">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">Категория цены</label>
+                                <select class="form-control" name="price_category">
+                                    <option value="">-- Автоматически --</option>
+                                    {% for category in price_categories %}
+                                    <option value="{{ category.id }}">{{ category.name }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="row mb-3">
+                            <div class="col-md-4">
+                                <label class="form-label">Тип топлива</label>
+                                <select class="form-control" name="fuel_type">
+                                    <option value="">-- Выберите --</option>
+                                    <option value="Бензин">Бензин</option>
+                                    <option value="Дизель">Дизель</option>
+                                    <option value="Газ">Газ</option>
+                                    <option value="Электричество">Электричество</option>
+                                    <option value="Гибрид">Гибрид</option>
+                                    <option value="Гибрид (бензин-электричество)">Гибрид (бензин-электричество)</option>
+                                    <option value="Гибрид (дизель-электричество)">Гибрид (дизель-электричество)</option>
+                                </select>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label">Коробка передач</label>
+                                <select class="form-control" name="transmission">
+                                    <option value="">-- Выберите --</option>
+                                    <option value="Автомат">Автомат</option>
+                                    <option value="Механика">Механика</option>
+                                    <option value="Вариатор">Вариатор</option>
+                                    <option value="Робот">Робот</option>
+                                </select>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label">Цвет</label>
+                                <select class="form-control" name="color">
+                                    <option value="">-- Выберите --</option>
+                                    <option value="Черный">Черный</option>
+                                    <option value="Белый">Белый</option>
+                                    <option value="Серый">Серый</option>
+                                    <option value="Синий">Синий</option>
+                                    <option value="Красный">Красный</option>
+                                    <option value="Зеленый">Зеленый</option>
+                                    <option value="Желтый">Желтый</option>
+                                    <option value="Серебристый">Серебристый</option>
+                                </select>
                             </div>
                         </div>
                     </div>
@@ -534,7 +587,7 @@ def quick_add():
                         <h5>Фотографии (URL)</h5>
                         <div class="row mb-3">
                             <div class="col-md-6">
-                                <label class="form-label">Фото 1 *</label>
+                                <label class="form-label required">Фото 1 (главное)</label>
                                 <input type="url" class="form-control" name="photo_url1" placeholder="https://example.com/photo1.jpg" required>
                             </div>
                             <div class="col-md-6">
@@ -556,7 +609,7 @@ def quick_add():
                     
                     <div class="d-flex justify-content-between mt-4">
                         <a href="{{ url_for('admin.index') }}" class="btn btn-secondary btn-back">← Назад в админку</a>
-                        <button type="submit" class="btn btn-primary">✅ Добавить автомобиль</button>
+                        <button type="submit" class="btn btn-primary btn-lg">✅ Добавить автомобиль</button>
                     </div>
                 </form>
             </div>
@@ -583,12 +636,17 @@ def quick_add():
             // Сбрасываем выбор модели
             modelSelect.value = "";
         }
+        
+        // Инициализация при загрузке страницы
+        document.addEventListener('DOMContentLoaded', function() {
+            updateModels();
+        });
     </script>
 </body>
 </html>
-    ''', brands=brands, models=models)
+    ''', brands=brands, models=models, price_categories=price_categories)
 
-# ИСПРАВЛЕННЫЕ ModelView для админки
+# ИСПРАВЛЕННЫЕ ModelView для админки - без дублирования имен
 class CarModelView(ModelView):
     column_list = ['id', 'title', 'price_usd', 'brand', 'model', 'year', 'price_category', 'is_active']
     column_searchable_list = ['title']
@@ -671,13 +729,6 @@ class BrandModelView(ModelView):
     can_edit = True
     can_delete = True
     
-    form_args = {
-        'name': {
-            'label': 'Название бренда',
-            'description': 'Например: Toyota, BMW'
-        }
-    }
-    
     def is_accessible(self):
         return current_user.is_authenticated and current_user.role == 'admin'
     
@@ -693,13 +744,6 @@ class CarModelModelView(ModelView):
     can_create = True
     can_edit = True
     can_delete = True
-    
-    form_args = {
-        'name': {
-            'label': 'Название модели',
-            'description': 'Например: Camry, X5'
-        }
-    }
     
     def is_accessible(self):
         return current_user.is_authenticated and current_user.role == 'admin'
@@ -740,7 +784,6 @@ class OrderModelView(ModelView):
         return redirect(url_for('login'))
 
 class SellRequestModelView(ModelView):
-    # Расширяем список колонок для отображения всей информации
     column_list = ['id', 'telegram_user_id', 'telegram_username', 'telegram_first_name', 
                    'car_brand', 'car_model', 'car_year', 'car_mileage', 'car_price', 
                    'car_description', 'phone', 'status', 'created_at']
@@ -762,15 +805,8 @@ class SellRequestModelView(ModelView):
     
     column_searchable_list = ['telegram_username', 'car_brand', 'car_model', 'phone']
     column_filters = ['status', 'created_at', 'car_brand']
-    
-    # Разрешаем редактирование статуса и телефона
     form_columns = ['status', 'phone', 'car_description']
-    
-    # Показываем больше информации в детальном просмотре
     can_view_details = True
-    column_details_list = ['id', 'telegram_user_id', 'telegram_username', 'telegram_first_name', 
-                          'car_brand', 'car_model', 'car_year', 'car_mileage', 'car_price', 
-                          'car_description', 'phone', 'status', 'created_at']
     
     can_create = False
     can_edit = True
@@ -818,19 +854,18 @@ class UserModelView(ModelView):
     def inaccessible_callback(self, name, **kwargs):
         return redirect(url_for('login'))
 
-# Создаем админку
-admin = Admin(app, name='Suvtekin Auto', template_mode='bootstrap3', url='/admin',
-              index_view=CarModelView(Car, db.session, name='Автомобили', endpoint='car'))
+# Создаем админку с уникальными endpoint именами
+admin = Admin(app, name='Suvtekin Auto', template_mode='bootstrap3', url='/admin')
 
-# Добавляем все модели в админку
-admin.add_view(CarModelView(Car, db.session, name='Автомобили', category='Авто'))
-admin.add_view(BrandModelView(Brand, db.session, name='Бренды', category='Справочники'))
-admin.add_view(CarModelModelView(CarModel, db.session, name='Модели', category='Справочники'))
-admin.add_view(PriceCategoryModelView(PriceCategory, db.session, name='Категории цен', category='Справочники'))
-admin.add_view(ManagerModelView(Manager, db.session, name='Менеджеры', category='Персонал'))
-admin.add_view(OrderModelView(Order, db.session, name='Заказы', category='Заявки'))
-admin.add_view(SellRequestModelView(SellRequest, db.session, name='Заявки на продажу', category='Заявки'))
-admin.add_view(UserModelView(User, db.session, name='Пользователи', category='Система'))
+# Добавляем все модели с уникальными endpoint именами
+admin.add_view(CarModelView(Car, db.session, name='Автомобили', category='Авто', endpoint='cars'))
+admin.add_view(BrandModelView(Brand, db.session, name='Бренды', category='Справочники', endpoint='brands'))
+admin.add_view(CarModelModelView(CarModel, db.session, name='Модели', category='Справочники', endpoint='carmodels'))
+admin.add_view(PriceCategoryModelView(PriceCategory, db.session, name='Категории цен', category='Справочники', endpoint='pricecategories'))
+admin.add_view(ManagerModelView(Manager, db.session, name='Менеджеры', category='Персонал', endpoint='managers'))
+admin.add_view(OrderModelView(Order, db.session, name='Заказы', category='Заявки', endpoint='orders'))
+admin.add_view(SellRequestModelView(SellRequest, db.session, name='Заявки на продажу', category='Заявки', endpoint='sellrequests'))
+admin.add_view(UserModelView(User, db.session, name='Пользователи', category='Система', endpoint='users'))
 
 # API endpoint для получения моделей по бренду
 @app.route('/api/models/<int:brand_id>')
@@ -1030,7 +1065,6 @@ def send_message(chat_id, text, reply_markup=None, parse_mode='Markdown'):
         params['reply_markup'] = json.dumps(reply_markup)
     try:
         response = requests.post(url, params=params, timeout=10)
-        logger.info(f"Отправка сообщения: {response.status_code}")
         return response.json()
     except Exception as e:
         logger.error(f"Ошибка отправки сообщения: {e}")
@@ -1052,16 +1086,6 @@ def send_photo(chat_id, photo_url, caption, reply_markup=None):
     except Exception as e:
         logger.error(f"Ошибка отправки фото: {e}")
         send_message(chat_id, caption, reply_markup)
-
-def send_media_group(chat_id, media_items):
-    url = f"{BASE_URL}/sendMediaGroup"
-    params = {'chat_id': chat_id, 'media': json.dumps(media_items)}
-    try:
-        response = requests.post(url, params=params, timeout=10)
-        return response.json()
-    except Exception as e:
-        logger.error(f"Ошибка отправки медиа группы: {e}")
-        return None
 
 def get_language_menu():
     return {
@@ -1159,8 +1183,6 @@ def handle_callback(callback_query):
     try:
         data = callback_query['data']
         chat_id = callback_query['message']['chat']['id']
-        username = callback_query['from'].get('username', '')
-        first_name = callback_query['from'].get('first_name', '')
         
         if data == 'back_menu':
             send_message(chat_id, t(chat_id, 'main_menu'), get_main_menu(chat_id))
@@ -1197,8 +1219,6 @@ def handle_message(message):
         text = message.get('text', '')
         username = message['chat'].get('username', '')
         first_name = message['chat'].get('first_name', '')
-        
-        logger.info(f"Сообщение от {chat_id}: {text}")
         
         # Проверяем выбран ли язык
         if chat_id not in user_languages:
